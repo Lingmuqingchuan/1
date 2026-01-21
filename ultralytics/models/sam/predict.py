@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -22,7 +23,8 @@ import torch.nn.functional as F
 from ultralytics.data.augment import LetterBox
 from ultralytics.engine.predictor import BasePredictor
 from ultralytics.engine.results import Results
-from ultralytics.utils import DEFAULT_CFG, LOGGER, ops
+from ultralytics.utils import DEFAULT_CFG, LOGGER, colorstr, ops
+from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.metrics import box_iou, mask_iou
 from ultralytics.utils.torch_utils import select_device, smart_inference_mode
 
@@ -555,6 +557,7 @@ class Predictor(BasePredictor):
         self.setup_source(image)
         assert len(self.dataset) == 1, "`set_image` only supports setting one image!"
         for batch in self.dataset:
+            self.batch = batch  # Store batch for inference method
             im = self.preprocess(batch[1])
             self.features = self.get_im_features(im)
             break
@@ -2323,6 +2326,7 @@ class SAM3SemanticPredictor(SAM3Predictor):
             results.append(Results(orig_img, path=img_path, names=names, masks=masks, boxes=boxes))
         return results
 
+    @smart_inference_mode()
     def inference(self, im, bboxes=None, labels=None, text: list[str] | None = None, *args, **kwargs):
         """Perform inference on a single image with optional prompts."""
         bboxes = self.prompts.pop("bboxes", bboxes)
@@ -2400,6 +2404,225 @@ class SAM3SemanticPredictor(SAM3Predictor):
             box_mask=torch.zeros(num_prompts, 0, device=self.device, dtype=torch.bool),
         )
         return geometric_prompt
+
+    def __call__(self, source=None, text=None, bboxes=None, labels=None, batch_size=None, stream=False, **kwargs):
+        """Run inference on images/video with text or bbox prompts.
+
+        Supports multiple usage patterns:
+        1. Single image (legacy): predictor.set_image(img); predictor(text=["person"])
+        2. Batch images (new): predictor(["img1.jpg", "img2.jpg"], text=["person"])
+        3. Video/stream: predictor("video.mp4", text=["person"], stream=True)
+
+        Args:
+            source (str | Path | np.ndarray | list | None): Source for inference.
+                - None: Use image from previous set_image() call
+                - Single image: str, Path, or np.ndarray
+                - Multiple images: list of the above
+                - Video file or URL: str or Path
+            text (list[str] | list[list[str]] | None): Text prompts. Either:
+                - Single list like ["person", "car"] - applies to all images
+                - List of lists matching image count - per-image prompts
+            bboxes (list | None): Bounding boxes. Either:
+                - Single array - applies to all images
+                - List matching image count - per-image bboxes
+            labels (list | None): Labels for bboxes, same structure as bboxes.
+            batch_size (int | None): Number of images per GPU batch for encoding. Defaults to self.args.batch.
+            stream (bool): Whether to stream results (for video sources).
+            **kwargs: Additional arguments passed to stream_inference.
+
+        Returns:
+            Results | list[Results] | generator: Single Results for one image,
+                list for multiple images, or generator if stream=True.
+
+        Examples:
+            >>> predictor = SAM3SemanticPredictor(overrides={"model": "sam3_s.pt"})
+            >>> # Legacy single-image API
+            >>> predictor.set_image("image.jpg")
+            >>> results = predictor(text=["person", "car"])
+            >>> # Batch API - same prompts for all images
+            >>> results = predictor(["img1.jpg", "img2.jpg"], text=["person", "car"])
+            >>> # Video streaming
+            >>> for result in predictor("video.mp4", text=["person"], stream=True):
+            ...     print(result)
+        """
+        # For video/stream sources, delegate to base class stream_inference
+        if stream or self._is_video_source(source):
+            if stream:
+                return self.stream_inference(source, text=text, bboxes=bboxes, labels=labels, **kwargs)
+            else:
+                return list(self.stream_inference(source, text=text, bboxes=bboxes, labels=labels, **kwargs))
+
+        images = source  # For image batch mode, source is images
+        if self.model is None:
+            self.setup_model()
+
+        # Handle legacy single-image API: set_image() then __call__(text=...)
+        if images is None:
+            if self.features is None:
+                raise ValueError("No image set. Call set_image() first or pass images to __call__().")
+            # Use the image previously provided to set_image() as the source for this call
+            # so that we follow the same batch processing path and return Results.
+            images = self.batch[0][0]
+
+        # Normalize to list
+        if not isinstance(images, list):
+            images = [images]
+
+        n_images = len(images)
+        if batch_size is None:
+            batch_size = getattr(self.args, "batch", 1)
+
+        # Validate and normalize prompts
+        text_per_image = self._normalize_prompts(text, n_images, "text")
+        bboxes_per_image = self._normalize_prompts(bboxes, n_images, "bboxes")
+        labels_per_image = self._normalize_prompts(labels, n_images, "labels")
+
+        # Load and preprocess all images
+        preprocessed_images = []
+        image_infos = []
+        imgsz = self.imgsz if self.imgsz is not None else self.args.imgsz
+        # Adjust imgsz to be compatible with stride (same as setup_source does)
+        imgsz = check_imgsz(imgsz, stride=self.stride, min_dim=2)
+        self.model.set_imgsz(imgsz)
+        letterbox = LetterBox(imgsz, auto=False, center=False, scale_fill=True)
+
+        # Initialize profilers for timing
+        profilers = (ops.Profile(device=self.device), ops.Profile(device=self.device), ops.Profile(device=self.device))
+
+        with profilers[0]:
+            for image in images:
+                orig_img = cv2.imread(str(image)) if isinstance(image, (str, Path)) else image
+                path = str(image) if isinstance(image, (str, Path)) else ""
+                if orig_img is None:
+                    raise FileNotFoundError(
+                        f"Image '{path}' could not be loaded. Please check that the file exists and is a valid image."
+                    )
+                image_infos.append({"orig_img": orig_img, "path": path, "shape": orig_img.shape})
+                im = torch.from_numpy(np.ascontiguousarray(letterbox(image=orig_img)[..., ::-1].transpose((2, 0, 1))))
+                im = (
+                    ((im.to(self.device) - self.mean) / self.std).half()
+                    if self.model.fp16
+                    else (im.to(self.device) - self.mean) / self.std
+                )
+                preprocessed_images.append(im)
+
+        # Batch encode images and run inference
+        results = []
+        inference_outputs = []  # Store inference outputs for postprocess
+        with profilers[1]:
+            for i in range(0, n_images, batch_size):
+                batch_end = min(i + batch_size, n_images)
+                batch_imgs = preprocessed_images[i:batch_end]
+                batch_tensor = torch.stack(batch_imgs, dim=0)
+
+                # GPU forward pass for backbone
+                features = self.get_im_features(batch_tensor)
+
+                # Run decoder for each image in batch
+                for j in range(len(batch_imgs)):
+                    idx = i + j
+                    single_features = self._extract_single_features(features, j)
+                    info = image_infos[idx]
+
+                    pred_masks, pred_bboxes = self.inference_features(
+                        features=single_features,
+                        src_shape=info["shape"],
+                        bboxes=bboxes_per_image[idx],
+                        labels=labels_per_image[idx],
+                        text=text_per_image[idx],
+                    )
+                    inference_outputs.append((idx, pred_masks, pred_bboxes))
+
+        # Postprocess: create Results objects
+        with profilers[2]:
+            for idx, pred_masks, pred_bboxes in inference_outputs:
+                info = image_infos[idx]
+                names = text_per_image[idx] if text_per_image[idx] else getattr(self.model, "names", ["object"])
+                results.append(
+                    Results(info["orig_img"], path=info["path"], names=names, masks=pred_masks, boxes=pred_bboxes)
+                )
+
+        # Set speed dict and save_dir on each result
+        for result in results:
+            result.speed = {
+                "preprocess": profilers[0].dt * 1e3 / n_images,
+                "inference": profilers[1].dt * 1e3 / n_images,
+                "postprocess": profilers[2].dt * 1e3 / n_images,
+            }
+            result.save_dir = str(self.save_dir)
+
+        # Save results if requested
+        if self.args.save or self.args.save_txt or self.args.save_crop:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            if self.args.save_txt:
+                (self.save_dir / "labels").mkdir(parents=True, exist_ok=True)
+            for i, result in enumerate(results):
+                info = image_infos[i]
+                p = Path(info["path"]) if info["path"] else Path(f"image{i}.jpg")
+                if self.args.save_txt:
+                    result.save_txt(self.save_dir / "labels" / f"{p.stem}.txt", save_conf=self.args.save_conf)
+                if self.args.save_crop:
+                    result.save_crop(save_dir=self.save_dir / "crops", file_name=p.stem)
+                if self.args.save:
+                    plotted = result.plot(
+                        line_width=self.args.line_width,
+                        boxes=self.args.show_boxes,
+                        conf=self.args.show_conf,
+                        labels=self.args.show_labels,
+                    )
+                    cv2.imwrite(str(self.save_dir / p.name), plotted)
+
+        # Log speed summary
+        if self.args.verbose and n_images:
+            t = tuple(x.t / n_images * 1e3 for x in profilers)
+            LOGGER.info(
+                f"Speed: %.1fms preprocess, %.1fms inference, %.1fms postprocess per image at shape "
+                f"{(batch_size, 3, *imgsz)}" % t
+            )
+
+        # Log save location
+        if self.args.save or self.args.save_txt or self.args.save_crop:
+            nl = len(list(self.save_dir.glob("labels/*.txt"))) if self.args.save_txt else 0
+            s = f"\n{nl} label{'s' * (nl > 1)} saved to {self.save_dir / 'labels'}" if self.args.save_txt else ""
+            LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}{s}")
+
+        return results[0] if len(results) == 1 else results
+
+    def _normalize_prompts(self, prompts, n_images, name):
+        """Normalize prompts to per-image format."""
+        if prompts is None:
+            return [None] * n_images
+        # Check if per-image prompts (list of lists for text, list of arrays for bboxes)
+        if isinstance(prompts, list) and len(prompts) == n_images:
+            if (name == "text" and all(isinstance(p, list) for p in prompts)) or (
+                name in ("bboxes", "labels") and all(p is None or hasattr(p, "__len__") for p in prompts)
+            ):
+                return prompts
+        return [prompts] * n_images
+
+    def _is_video_source(self, source):
+        """Check if source is a video file or stream."""
+        if source is None or isinstance(source, (list, np.ndarray)):
+            return False
+        if not isinstance(source, (str, Path)):
+            return False
+        s = str(source).lower()
+        video_exts = (".mp4", ".avi", ".mov", ".mkv", ".wmv", ".webm", ".m4v", ".flv")
+        return s.endswith(video_exts) or "youtube.com" in s or "youtu.be" in s or s.startswith(("rtsp://", "rtmp://"))
+
+    def _extract_single_features(self, batched_features, idx):
+        """Extract features for a single image from batched features."""
+        single = {}
+        for key, value in batched_features.items():
+            if isinstance(value, torch.Tensor):
+                single[key] = value[idx : idx + 1]
+            elif isinstance(value, list):
+                single[key] = [v[idx : idx + 1] if isinstance(v, torch.Tensor) else v for v in value]
+            elif isinstance(value, dict):
+                single[key] = self._extract_single_features(value, idx)
+            else:
+                single[key] = value
+        return single
 
 
 class SAM3VideoPredictor(SAM2VideoPredictor, SAM3Predictor):
